@@ -14,9 +14,10 @@ use std::time::Duration;
 use lk_jwt_service_integration_tests::{
     FakeHomeserver, FakeRedis, FakeSfu, Service, ServiceConfig, expect_joined_members_request,
     expect_no_delete_room_requests, expect_no_joined_members_requests,
-    expect_no_remove_participant_requests, livekit_identity, livekit_room_alias, send_sfu_webhook,
-    wait_for_delete_room_request, wait_for_joined_members_request, wait_for_participant_persisted,
-    wait_for_participant_removed, wait_for_remove_participant_request,
+    expect_no_remove_participant_requests, expect_permissions_revoked_before_removal,
+    livekit_identity, livekit_room_alias, send_sfu_webhook, wait_for_delete_room_request,
+    wait_for_joined_members_request, wait_for_participant_persisted,
+    wait_for_remove_participant_request, wait_for_remove_participant_request_count,
 };
 use serde_json::{Value, json};
 
@@ -170,7 +171,43 @@ async fn non_member_is_removed_from_sfu() {
     // Alice leaves the room.
     hs.set_joined_members(ROOM_ID, &[]);
     wait_for_remove_participant_request(&sfu, &room, &identity, ENFORCEMENT_TIMEOUT).await;
+    expect_permissions_revoked_before_removal(&sfu, &room, &identity);
     expect_no_delete_room_requests(&sfu);
+}
+
+/// A removed participant who reconnects with a token that is still valid is
+/// removed again right away, without waiting for the next periodic check.
+#[tokio::test]
+async fn kicked_participant_rejoining_is_removed_again() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let sfu = FakeSfu::new().await;
+    hs.set_joined_members(ROOM_ID, &[]);
+
+    // An interval long enough to tell a reconnect-triggered check from the
+    // next periodic one.
+    const INTERVAL_SECS: u64 = 5;
+    let mut config = service_config(&hs, &sfu, None);
+    config.extra_env = app_service_env(hs.server_name(), INTERVAL_SECS);
+    let svc = Service::start(config).await;
+    let (room, identity) = mint_local_token(&svc, &sfu, &alice.user_id, "member-1").await;
+    connect(&svc, &sfu, &room, &identity).await;
+
+    // The first periodic check removes them.
+    wait_for_remove_participant_request(&sfu, &room, &identity, ENFORCEMENT_TIMEOUT).await;
+
+    // Reconnect with the still-valid token: present again, join webhook. The
+    // second removal must land well within the interval, i.e. it cannot be
+    // the next periodic check.
+    connect(&svc, &sfu, &room, &identity).await;
+    wait_for_remove_participant_request_count(
+        &sfu,
+        &room,
+        &identity,
+        2,
+        Duration::from_secs(INTERVAL_SECS / 2),
+    )
+    .await;
 }
 
 /// A connected participant whose user stays in the room is left alone.
@@ -361,7 +398,6 @@ async fn tracked_participants_survive_restart() {
 
     let _svc = Service::start(service_config(&hs, &sfu, Some(&redis))).await;
     wait_for_remove_participant_request(&sfu, &room, &identity, ENFORCEMENT_TIMEOUT).await;
-    wait_for_participant_removed(&redis, &room, &identity, ENFORCEMENT_TIMEOUT).await;
 }
 
 /// A zero check interval disables membership enforcement entirely.

@@ -72,6 +72,7 @@ struct HandlerTestDeps {
     is_user_joined_fn: Option<IsJoinedFn>,
     request_get_token_via_federation_fn: Option<RequestGetTokenViaFederationFn>,
     remove_participant_fn: Option<RemoveParticipantFn>,
+    revoke_participant_permissions_fn: Option<RemoveParticipantFn>,
     delete_livekit_room_fn: Option<DeleteLiveKitRoomFn>,
     get_joined_members_fn: Option<GetJoinedMembersFn>,
 }
@@ -206,6 +207,18 @@ impl Deps for HandlerTestDeps {
         match &self.remove_participant_fn {
             Some(f) => f(room, identity),
             None => panic!("remove_participant not mocked in HandlerTestDeps"),
+        }
+    }
+
+    async fn revoke_participant_permissions(
+        &self,
+        _lk_auth: &LiveKitAuth,
+        room: &LiveKitRoomAlias,
+        identity: &LiveKitIdentity,
+    ) -> Result<(), String> {
+        match &self.revoke_participant_permissions_fn {
+            Some(f) => f(room, identity),
+            None => panic!("revoke_participant_permissions not mocked in HandlerTestDeps"),
         }
     }
 
@@ -4763,6 +4776,7 @@ async fn test_revoked_participant_drops_delayed_event_job() {
         execute_delayed_event_action_fn: execute_delayed_event_action_ok(),
         // The monitor: the user is gone from the room.
         get_joined_members_fn: Some(Box::new(|_, _| Ok(std::collections::HashSet::new()))),
+        revoke_participant_permissions_fn: Some(Box::new(|_, _| Ok(()))),
         remove_participant_fn: Some(Box::new(move |room, identity| {
             removed_clone.lock().unwrap().push(ParticipantKey {
                 room: room.clone(),
@@ -4822,11 +4836,13 @@ async fn test_revoked_participant_drops_delayed_event_job() {
             .expect("timed out waiting for the job to be deleted"),
         Some(key.clone())
     );
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), participants.deleted_rx.recv())
-            .await
-            .expect("timed out waiting for the participant to be deleted"),
-        Some(key.clone())
+    // The participant themselves stays tracked, flagged as kicked, so a
+    // reconnect with their still-valid token is caught.
+    let tracked = sole_tracked_participant(&handler).await;
+    assert!(tracked.kicked && !tracked.connected);
+    assert!(
+        participants.deleted_rx.try_recv().is_err(),
+        "expected the kicked participant to stay in the store"
     );
     handler.close().await;
     assert_eq!(removed.lock().unwrap().as_slice(), [key]);

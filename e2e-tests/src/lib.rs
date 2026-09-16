@@ -274,19 +274,24 @@ pub struct LiveKitParticipant {
     /// [`LiveKitParticipant::disconnect`].
     leave_tx: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+    /// The most recent access token the SFU pushed over the signalling
+    /// connection, if any. See [`LiveKitParticipant::wait_for_refreshed_token`].
+    refreshed_token: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
+
+/// The signalling socket type of a connected participant.
+type SignalSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Connects to the SFU at `sfu_addr` with the given access token and waits
 /// for the JoinResponse — the point at which the SFU has admitted the
 /// participant — returning the still-open signalling socket alongside the
-/// ping interval it carried.
+/// ping interval it carried. Fails when the SFU does not admit the
+/// participant; panics on transport problems and protocol violations.
 async fn connect_and_join(
     sfu_addr: &str,
     access_token: &str,
-) -> (
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Duration,
-) {
+) -> Result<(SignalSocket, Duration), String> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -294,10 +299,20 @@ async fn connect_and_join(
         "ws://{sfu_addr}/rtc?access_token={access_token}&protocol=15&sdk=other&version=1.0.0&auto_subscribe=1"
     );
     let connect = tokio_tungstenite::connect_async(&url);
-    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), connect)
+    let (mut socket, _) = match tokio::time::timeout(Duration::from_secs(10), connect)
         .await
         .unwrap_or_else(|_| panic!("timed out connecting to the LiveKit SFU"))
-        .unwrap_or_else(|e| panic!("failed to connect to the LiveKit SFU: {e}"));
+    {
+        Ok(connected) => connected,
+        // The SFU rejects a bad token at the HTTP upgrade already.
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            return Err(format!(
+                "the SFU rejected the connection with HTTP {}",
+                resp.status()
+            ));
+        }
+        Err(e) => panic!("failed to connect to the LiveKit SFU: {e}"),
+    };
 
     let read_deadline = Duration::from_secs(10);
     let ping_interval = loop {
@@ -310,33 +325,57 @@ async fn connect_and_join(
         let bytes = match msg {
             Message::Binary(bytes) => bytes,
             Message::Close(frame) => {
-                panic!("the SFU rejected the connection (likely an invalid token): {frame:?}")
+                return Err(format!("the SFU rejected the connection: {frame:?}"));
             }
             _ => continue,
         };
 
         let response = <livekit_protocol::SignalResponse as prost::Message>::decode(&bytes[..])
             .unwrap_or_else(|e| panic!("failed to decode SignalResponse: {e}"));
-        if let Some(livekit_protocol::signal_response::Message::Join(join)) = response.message {
-            assert!(
-                join.room.is_some(),
-                "expected the JoinResponse to carry room info"
-            );
-            break Duration::from_secs(join.ping_interval.max(1) as u64);
+        match response.message {
+            Some(livekit_protocol::signal_response::Message::Join(join)) => {
+                assert!(
+                    join.room.is_some(),
+                    "expected the JoinResponse to carry room info"
+                );
+                break Duration::from_secs(join.ping_interval.max(1) as u64);
+            }
+            Some(livekit_protocol::signal_response::Message::Leave(leave)) => {
+                return Err(format!(
+                    "the SFU told the participant to leave before joining: {leave:?}"
+                ));
+            }
+            _ => {}
         }
     };
 
-    (socket, ping_interval)
+    Ok((socket, ping_interval))
 }
 
 impl LiveKitParticipant {
     /// Connects to the SFU at `sfu_addr` with the given access token and
     /// returns once the SFU has admitted the participant into the room.
+    /// Panics when the SFU does not admit them; see
+    /// [`LiveKitParticipant::try_connect`] for a fallible variant.
     pub async fn connect(sfu_addr: &str, access_token: &str) -> LiveKitParticipant {
+        Self::try_connect(sfu_addr, access_token)
+            .await
+            .unwrap_or_else(|e| panic!("{e} (likely an invalid token)"))
+    }
+
+    /// Connects to the SFU at `sfu_addr` with the given access token and
+    /// returns once the SFU has admitted the participant into the room, or
+    /// an error when the SFU turns them away.
+    pub async fn try_connect(
+        sfu_addr: &str,
+        access_token: &str,
+    ) -> Result<LiveKitParticipant, String> {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
 
-        let (mut socket, ping_interval) = connect_and_join(sfu_addr, access_token).await;
+        let (mut socket, ping_interval) = connect_and_join(sfu_addr, access_token).await?;
+        let refreshed_token = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let refreshed_token_writer = refreshed_token.clone();
 
         let (leave_tx, mut leave_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -382,18 +421,23 @@ impl LiveKitParticipant {
                     // A Leave from the SFU means it is throwing the
                     // participant out (or closing the room): the participant
                     // is gone from that moment on, whether or not the socket
-                    // is closed right away.
+                    // is closed right away. Refreshed tokens are kept for
+                    // tests that reconnect with them.
                     msg = socket.next() => {
                         match msg {
                             None | Some(Err(_)) => return,
                             Some(Ok(Message::Binary(bytes))) => {
-                                if let Ok(response) =
-                                    <livekit_protocol::SignalResponse as prost::Message>::decode(&bytes[..])
-                                    && let Some(livekit_protocol::signal_response::Message::Leave(_)) =
-                                        response.message
-                                {
-                                    let _ = socket.close(None).await;
-                                    return;
+                                let response =
+                                    <livekit_protocol::SignalResponse as prost::Message>::decode(&bytes[..]);
+                                match response.ok().and_then(|r| r.message) {
+                                    Some(livekit_protocol::signal_response::Message::Leave(_)) => {
+                                        let _ = socket.close(None).await;
+                                        return;
+                                    }
+                                    Some(livekit_protocol::signal_response::Message::RefreshToken(token)) => {
+                                        *refreshed_token_writer.lock().unwrap() = Some(token);
+                                    }
+                                    _ => {}
                                 }
                             }
                             Some(Ok(_)) => {}
@@ -403,9 +447,27 @@ impl LiveKitParticipant {
             }
         });
 
-        LiveKitParticipant {
+        Ok(LiveKitParticipant {
             leave_tx: Some(leave_tx),
             task,
+            refreshed_token,
+        })
+    }
+
+    /// Waits for the SFU to push a refreshed access token over the
+    /// signalling connection — it does so right after the join and every few
+    /// minutes thereafter — returning the most recent one, or None once
+    /// `timeout` elapses without any.
+    pub async fn wait_for_refreshed_token(&self, timeout: Duration) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(token) = self.refreshed_token.lock().unwrap().clone() {
+                return Some(token);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -459,7 +521,9 @@ pub async fn attempt_publish_track(sfu_addr: &str, access_token: &str) -> bool {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let (mut socket, _) = connect_and_join(sfu_addr, access_token).await;
+    let (mut socket, _) = connect_and_join(sfu_addr, access_token)
+        .await
+        .unwrap_or_else(|e| panic!("{e} (likely an invalid token)"));
 
     let cid = format!("e2e-track-{}", uuid::Uuid::new_v4());
     let add_track = livekit_protocol::SignalRequest {

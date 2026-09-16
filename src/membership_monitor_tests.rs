@@ -33,6 +33,9 @@ struct MonitorTestDeps {
     is_server_joined_fn: Option<IsServerJoinedFn>,
     /// Every room `get_joined_members` was called for.
     joined_members_calls: Arc<Mutex<Vec<String>>>,
+    /// Every participant-mutating SFU call, in order, as
+    /// "<revoke|remove> <identity>".
+    sfu_calls: Arc<Mutex<Vec<String>>>,
     /// Every participant removed from the SFU.
     removed_tx: Option<mpsc::UnboundedSender<ParticipantKey>>,
     /// Every LiveKit room deleted.
@@ -62,12 +65,29 @@ impl Deps for MonitorTestDeps {
         }
     }
 
+    async fn revoke_participant_permissions(
+        &self,
+        _lk_auth: &LiveKitAuth,
+        _room: &LiveKitRoomAlias,
+        identity: &LiveKitIdentity,
+    ) -> Result<(), String> {
+        self.sfu_calls
+            .lock()
+            .unwrap()
+            .push(format!("revoke {identity}"));
+        Ok(())
+    }
+
     async fn remove_participant(
         &self,
         _lk_auth: &LiveKitAuth,
         room: &LiveKitRoomAlias,
         identity: &LiveKitIdentity,
     ) -> Result<(), String> {
+        self.sfu_calls
+            .lock()
+            .unwrap()
+            .push(format!("remove {identity}"));
         if let Some(tx) = &self.removed_tx {
             let _ = tx.send(ParticipantKey {
                 room: room.clone(),
@@ -150,6 +170,7 @@ struct Harness {
     removed_rx: mpsc::UnboundedReceiver<ParticipantKey>,
     deleted_rx: mpsc::UnboundedReceiver<LiveKitRoomAlias>,
     joined_members_calls: Arc<Mutex<Vec<String>>>,
+    sfu_calls: Arc<Mutex<Vec<String>>>,
 }
 
 /// A CS-API lookup that always resolves.
@@ -182,6 +203,7 @@ fn new_harness_with(
     deps.removed_tx = Some(removed_tx);
     deps.deleted_tx = Some(deleted_tx);
     let joined_members_calls = deps.joined_members_calls.clone();
+    let sfu_calls = deps.sfu_calls.clone();
 
     let (revoked_tx, revoked_rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
@@ -205,7 +227,19 @@ fn new_harness_with(
         removed_rx,
         deleted_rx,
         joined_members_calls,
+        sfu_calls,
     }
+}
+
+/// The one participant the monitor tracks, or a panic.
+async fn sole_tracked(monitor: &MembershipMonitor) -> TrackedParticipant {
+    let snapshot = monitor.snapshot().await;
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "expected exactly one tracked participant, got {snapshot:?}"
+    );
+    snapshot.into_iter().next().unwrap()
 }
 
 /// A registration for `mxid` in `room_id`, in the given slot and with the
@@ -256,8 +290,9 @@ fn keys(snapshot: &[TrackedParticipant]) -> HashSet<ParticipantKey> {
 
 // ── kicking ───────────────────────────────────────────────────────────────────
 
-/// A connected participant whose user is no longer in the room is removed
-/// from the SFU, dropped from tracking and reported as revoked.
+/// A connected participant whose user is no longer in the room has their
+/// media permissions revoked and is removed from the SFU, in that order, is
+/// reported as revoked, and stays tracked as kicked.
 #[tokio::test]
 async fn connected_non_member_is_kicked() {
     let mut h = new_harness(
@@ -280,8 +315,134 @@ async fn connected_non_member_is_kicked() {
         recv_bounded_timeout(&mut h.revoked_rx, "revocation").await,
         alice.key()
     );
-    assert!(h.monitor.snapshot().await.is_empty());
+    assert_eq!(
+        h.sfu_calls.lock().unwrap().as_slice(),
+        [
+            format!("revoke {}", alice.livekit_identity),
+            format!("remove {}", alice.livekit_identity),
+        ],
+        "expected the permission revocation to precede the removal"
+    );
+    let tracked = sole_tracked(&h.monitor).await;
+    assert_eq!(tracked.stored.key(), alice.key());
+    assert!(tracked.kicked && !tracked.connected);
     assert_quiet(&mut h.deleted_rx, "room deletion").await;
+    h.cancel.cancel();
+    h.monitor.close().await;
+}
+
+// ── rejoining after a kick ────────────────────────────────────────────────────
+
+/// A kicked participant stays tracked when the SFU reports their departure,
+/// and their reconnect triggers an immediate membership re-check — which,
+/// with the user still gone from the room, removes them again.
+#[tokio::test]
+async fn kicked_participant_reconnecting_is_removed_again() {
+    let mut h = new_harness(
+        MonitorTestDeps {
+            get_joined_members_fn: members(&[]),
+            ..Default::default()
+        },
+        None,
+    );
+    let alice = registration(ROOM_A, ALICE, "m.call#", "m1");
+    register_connected(&h.monitor, &alice).await;
+    h.monitor.sweep_now().await;
+    assert_eq!(
+        recv_timeout(&mut h.removed_rx, "removal").await,
+        alice.key()
+    );
+    recv_bounded_timeout(&mut h.revoked_rx, "revocation").await;
+
+    // The SFU reports the removal as a departure: still tracked.
+    h.monitor
+        .notify_sfu_event(SfuEvent::ParticipantLeft(alice.key()))
+        .await;
+    let tracked = sole_tracked(&h.monitor).await;
+    assert!(tracked.kicked && !tracked.connected);
+
+    // The reconnect alone — no `sweep_now`, and the periodic sweep is an
+    // hour away — gets them removed again.
+    h.monitor
+        .notify_sfu_event(SfuEvent::ParticipantJoined(alice.key()))
+        .await;
+    assert_eq!(
+        recv_timeout(&mut h.removed_rx, "second removal").await,
+        alice.key()
+    );
+    assert_eq!(
+        recv_bounded_timeout(&mut h.revoked_rx, "second revocation").await,
+        alice.key()
+    );
+    assert_eq!(h.joined_members_calls.lock().unwrap().len(), 2);
+    h.cancel.cancel();
+    h.monitor.close().await;
+}
+
+/// A kicked participant who has since been let back into the room and
+/// reconnects with a still-valid token is left alone and is no longer
+/// considered kicked.
+#[tokio::test]
+async fn kicked_participant_readmitted_to_the_room_stays() {
+    let member = Arc::new(AtomicBool::new(false));
+    let member_clone = member.clone();
+    let mut h = new_harness(
+        MonitorTestDeps {
+            get_joined_members_fn: Some(Box::new(move |_| {
+                Ok(if member_clone.load(Ordering::SeqCst) {
+                    HashSet::from([ALICE.to_owned()])
+                } else {
+                    HashSet::new()
+                })
+            })),
+            ..Default::default()
+        },
+        None,
+    );
+    let alice = registration(ROOM_A, ALICE, "m.call#", "m1");
+    register_connected(&h.monitor, &alice).await;
+    h.monitor.sweep_now().await;
+    recv_timeout(&mut h.removed_rx, "removal").await;
+    recv_bounded_timeout(&mut h.revoked_rx, "revocation").await;
+
+    // Re-invited, then reconnecting.
+    member.store(true, Ordering::SeqCst);
+    h.monitor
+        .notify_sfu_event(SfuEvent::ParticipantJoined(alice.key()))
+        .await;
+    h.monitor.sweep_now().await; // Waits for the join-triggered sweep too.
+
+    assert_quiet(&mut h.removed_rx, "removal").await;
+    let tracked = sole_tracked(&h.monitor).await;
+    assert!(tracked.connected && !tracked.kicked);
+    h.cancel.cancel();
+    h.monitor.close().await;
+}
+
+/// A new token for a kicked participant — the homeserver vouched for their
+/// membership again — clears the kick.
+#[tokio::test]
+async fn re_registration_clears_kick() {
+    let mut h = new_harness(
+        MonitorTestDeps {
+            get_joined_members_fn: members(&[]),
+            participant_exists_fn: Some(Box::new(|_, _| Ok(false))),
+            ..Default::default()
+        },
+        None,
+    );
+    let alice = registration(ROOM_A, ALICE, "m.call#", "m1");
+    register_connected(&h.monitor, &alice).await;
+    h.monitor.sweep_now().await;
+    recv_timeout(&mut h.removed_rx, "removal").await;
+
+    h.monitor.register(alice.clone()).await;
+
+    let tracked = sole_tracked(&h.monitor).await;
+    assert!(!tracked.kicked && !tracked.connected);
+    // Pending again: a sweep leaves them alone until they show up.
+    h.monitor.sweep_now().await;
+    assert_quiet(&mut h.removed_rx, "removal").await;
     h.cancel.cancel();
     h.monitor.close().await;
 }
@@ -345,7 +506,7 @@ async fn pending_participant_is_kicked_once_connected() {
         recv_timeout(&mut h.removed_rx, "removal").await,
         alice.key()
     );
-    assert!(h.monitor.snapshot().await.is_empty());
+    assert!(sole_tracked(&h.monitor).await.kicked);
     h.cancel.cancel();
     h.monitor.close().await;
 }
@@ -380,10 +541,18 @@ async fn one_membership_query_per_room() {
         recv_timeout(&mut h.removed_rx, "second removal").await,
     ]);
     assert_eq!(removed, HashSet::from([alice_1.key(), alice_2.key()]));
+    let snapshot = h.monitor.snapshot().await;
     assert_eq!(
-        keys(&h.monitor.snapshot().await),
-        HashSet::from([bob.key()])
+        keys(&snapshot),
+        HashSet::from([alice_1.key(), alice_2.key(), bob.key()])
     );
+    for p in &snapshot {
+        assert_eq!(
+            p.kicked,
+            p.stored.matrix_user_id == ALICE,
+            "unexpected kick state for {p:?}"
+        );
+    }
     h.cancel.cancel();
     h.monitor.close().await;
 }
@@ -414,10 +583,15 @@ async fn rooms_are_independent() {
 
     assert_eq!(recv_timeout(&mut h.removed_rx, "removal").await, in_a.key());
     assert_quiet(&mut h.removed_rx, "second removal").await;
-    assert_eq!(
-        keys(&h.monitor.snapshot().await),
-        HashSet::from([in_b.key()])
-    );
+    let snapshot = h.monitor.snapshot().await;
+    assert_eq!(keys(&snapshot), HashSet::from([in_a.key(), in_b.key()]));
+    for p in &snapshot {
+        assert_eq!(
+            p.kicked,
+            p.stored.matrix_room_id == ROOM_A,
+            "unexpected kick state for {p:?}"
+        );
+    }
     h.cancel.cancel();
     h.monitor.close().await;
 }
@@ -685,45 +859,73 @@ fn tracked(
             registered_at,
         },
         connected,
+        kicked: false,
     }
 }
 
-/// A pending participant confirmed absent from the SFU is forgotten once
+/// An absent participant — never connected, or kicked — is forgotten once
 /// their token has expired, and kept while it is still valid. Connected
 /// participants are never expired this way.
 #[test]
-fn absent_pending_participants_expire_with_their_token() {
+fn absent_participants_expire_with_their_token() {
     let now = Utc::now();
-    let ttl = chrono::Duration::from_std(PENDING_TTL).unwrap();
+    let ttl = chrono::Duration::from_std(ABSENT_TTL).unwrap();
     let old = registration(ROOM_A, ALICE, "m.call#", "old");
+    let old_kicked = registration(ROOM_A, ALICE, "m.call#", "old-kicked");
     let young = registration(ROOM_A, ALICE, "m.call#", "young");
+    let young_kicked = registration(ROOM_A, ALICE, "m.call#", "young-kicked");
     let connected = registration(ROOM_A, ALICE, "m.call#", "connected");
     let mut participants = HashMap::from([
         (old.key(), tracked(&old, false, now - ttl)),
+        (
+            old_kicked.key(),
+            TrackedParticipant {
+                kicked: true,
+                ..tracked(&old_kicked, false, now - ttl)
+            },
+        ),
         (young.key(), tracked(&young, false, now - ttl / 2)),
+        (
+            young_kicked.key(),
+            TrackedParticipant {
+                kicked: true,
+                ..tracked(&young_kicked, false, now - ttl / 2)
+            },
+        ),
         (connected.key(), tracked(&connected, true, now - ttl * 2)),
     ]);
 
-    let actions = apply_sweep_outcome(
+    let mut actions = apply_sweep_outcome(
         &mut participants,
         SweepOutcome {
             present: vec![],
-            absent: vec![old.key(), young.key(), connected.key()],
+            absent: vec![
+                old.key(),
+                old_kicked.key(),
+                young.key(),
+                young_kicked.key(),
+                connected.key(),
+            ],
             rooms: vec![(ROOM_A.into(), RoomMembership::Unknown)],
         },
         now,
     );
 
+    actions
+        .untracked
+        .sort_by(|a, b| a.identity.cmp(&b.identity));
+    let mut expected = vec![old.key(), old_kicked.key()];
+    expected.sort_by(|a, b| a.identity.cmp(&b.identity));
     assert_eq!(
         actions,
         SweepActions {
-            forgotten: vec![old.key()],
+            untracked: expected,
             ..Default::default()
         }
     );
     assert_eq!(
         participants.keys().cloned().collect::<HashSet<_>>(),
-        HashSet::from([young.key(), connected.key()])
+        HashSet::from([young.key(), young_kicked.key(), connected.key()])
     );
 }
 
@@ -759,8 +961,10 @@ fn presence_learnt_in_sweep_enables_kick() {
     );
     assert_eq!(
         participants.keys().cloned().collect::<HashSet<_>>(),
-        HashSet::from([unseen.key()])
+        HashSet::from([seen.key(), unseen.key()])
     );
+    assert!(participants[&seen.key()].kicked && !participants[&seen.key()].connected);
+    assert!(!participants[&unseen.key()].kicked);
 }
 
 /// The sweep input covers every Matrix room once and lists exactly the
@@ -790,7 +994,7 @@ fn sweep_input_is_deduplicated() {
 
 /// Registrations are persisted and recovered by a fresh monitor, which then
 /// verifies them against the SFU and enforces membership as usual. Kicked
-/// participants are removed from the store.
+/// participants stay in the store, since they stay tracked.
 #[tokio::test]
 async fn participants_are_persisted_and_recovered() {
     let store = new_in_memory_store();
@@ -832,11 +1036,10 @@ async fn participants_are_persisted_and_recovered() {
         recv_bounded_timeout(&mut h.revoked_rx, "revocation").await,
         alice.key()
     );
-    h.monitor.sweep_now().await; // Flushes the store writer's queue.
-    assert!(h.monitor.snapshot().await.is_empty());
+    assert!(sole_tracked(&h.monitor).await.kicked);
     h.cancel.cancel();
     h.monitor.close().await;
-    assert!(store.all_participants().await.unwrap().is_empty());
+    assert_eq!(store.all_participants().await.unwrap().len(), 1);
 }
 
 /// Participants that leave the SFU are removed from the store too.

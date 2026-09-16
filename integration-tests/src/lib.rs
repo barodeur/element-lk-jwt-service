@@ -16,6 +16,7 @@ pub use fake_homeserver::{
 pub use fake_redis::FakeRedis;
 pub use fake_sfu::{
     CreateRoomRequest, DeleteRoomRequest, FakeSfu, GetParticipantRequest, RemoveParticipantRequest,
+    UpdateParticipantRequest,
 };
 pub use harness::{DEFAULT_LK_URL, LIVEKIT_KEY, LIVEKIT_SECRET, Service, ServiceConfig};
 pub use helpers::{
@@ -26,9 +27,10 @@ pub use helpers::{
     expect_no_delete_room_requests, expect_no_fed_proxy_requests, expect_no_is_joined_request,
     expect_no_is_joined_requests, expect_no_joined_members_requests,
     expect_no_remove_participant_requests, expect_no_user_info_lookups,
-    expect_server_is_joined_request, expect_user_info_lookup, livekit_identity, livekit_room_alias,
-    send_sfu_webhook, wait_for_delayed_event_request, wait_for_delayed_event_request_count,
+    expect_permissions_revoked_before_removal, expect_server_is_joined_request,
+    expect_user_info_lookup, livekit_identity, livekit_room_alias, send_sfu_webhook,
+    wait_for_delayed_event_request, wait_for_delayed_event_request_count,
     wait_for_delete_room_request, wait_for_job_removed, wait_for_joined_members_request,
     wait_for_participant_persisted, wait_for_participant_removed,
-    wait_for_remove_participant_request,
+    wait_for_remove_participant_request, wait_for_remove_participant_request_count,
 };

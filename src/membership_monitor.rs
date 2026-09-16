@@ -36,6 +36,30 @@
 //! `participant_joined` webhook only delays enforcement — and they are
 //! forgotten once the token they were issued has expired without a connect.
 //!
+//! # Rejoins
+//!
+//! Removing a participant does not invalidate their access tokens: the one
+//! this service minted stays valid until it expires, and the SFU keeps
+//! refreshing a connected participant's token over the signalling channel
+//! with `roomJoin` intact. A kicked participant can therefore reconnect.
+//! Three things limit that:
+//!
+//!   - Before the removal, the participant's publish and subscribe
+//!     permissions are revoked. The SFU immediately pushes a refreshed token
+//!     carrying those revoked grants, so a client reconnecting with its
+//!     latest token joins without being able to send or receive media.
+//!   - The removal names the current time as the token revocation cutoff
+//!     (`revoke_token_ts`), which LiveKit Cloud uses to reject every earlier
+//!     token; self-hosted SFUs ignore it.
+//!   - A kicked participant stays tracked, flagged as kicked, until their
+//!     token can no longer be valid. Should they reconnect anyway — with the
+//!     original token, say — the `participant_joined` webhook triggers an
+//!     immediate sweep, which removes them again unless they have since
+//!     become a room member once more. The SFU only sends that webhook once
+//!     the participant is active (media connected); a reconnect that never
+//!     gets that far is caught by the next periodic sweep's presence check
+//!     instead. A new token (i.e. a fresh registration) clears the flag.
+//!
 //! Tracked participants are persisted through the [`Store`] so enforcement
 //! resumes after a restart; recovered entries start out as pending and are
 //! verified against the SFU by the first sweep.
@@ -70,11 +94,12 @@ use crate::store::{Store, StoredParticipant};
 /// How many homeserver / SFU requests a sweep has in flight at once.
 const SWEEP_CONCURRENCY: usize = 8;
 
-/// How long a participant who was issued a token but never showed up on the
-/// SFU stays tracked. Matches the lifetime of the tokens this service mints
-/// (see `get_join_token`): once the token has expired, it cannot be used to
-/// connect any more.
-pub const PENDING_TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a participant who is absent from the SFU — never connected, or
+/// kicked — stays tracked, counted from when their token was minted. Covers
+/// the lifetime of the tokens this service mints (one hour, see
+/// `get_join_token`) plus the ten minutes by which the SFU's token refresh
+/// can extend it. After that, no token they hold can be used to connect.
+pub const ABSENT_TTL: Duration = Duration::from_secs(70 * 60);
 
 /// How long the monitor keeps retrying a single SFU removal before giving up
 /// on it (the next sweep will try again if the participant is still there).
@@ -119,6 +144,10 @@ pub struct TrackedParticipant {
     pub stored: StoredParticipant,
     /// Whether the participant is known to be connected to the SFU.
     pub connected: bool,
+    /// Whether the participant was removed from the SFU for losing their
+    /// room membership. Such participants stay tracked so a reconnect with a
+    /// still-valid token is caught, see the module documentation.
+    pub kicked: bool,
 }
 
 /// Configuration of a [`MembershipMonitor`].
@@ -358,6 +387,7 @@ impl MembershipMonitor {
                             TrackedParticipant {
                                 stored: participant,
                                 connected: false,
+                                kicked: false,
                             },
                         );
                     }
@@ -423,11 +453,10 @@ impl MembershipMonitor {
                 Some(outcome) = sweep_rx.recv() => {
                     sweep_in_flight = false;
                     let actions = apply_sweep_outcome(&mut participants, outcome, Utc::now());
-                    for key in &actions.forgotten {
+                    for key in &actions.untracked {
                         enqueue_store_op(StoreOp::Delete(key.clone())).await;
                     }
                     for key in &actions.revoked {
-                        enqueue_store_op(StoreOp::Delete(key.clone())).await;
                         tokio::select! {
                             _ = self.cancel.cancelled() => {}
                             _ = ctx.revoked_tx.send(key.clone()) => {}
@@ -463,7 +492,9 @@ impl MembershipMonitor {
                             let key = registration.key();
                             // A re-issued token for a connected participant
                             // keeps its connected state; only the timestamp
-                            // moves.
+                            // moves. A new token also means the homeserver
+                            // just vouched for the user's membership again,
+                            // which clears any earlier kick.
                             let connected = participants.get(&key).is_some_and(|p| p.connected);
                             let stored = StoredParticipant {
                                 matrix_room_id: registration.matrix_room_id,
@@ -477,15 +508,32 @@ impl MembershipMonitor {
                                 lk_id = %key.identity, connected,
                                 "MembershipMonitor: tracking participant");
                             enqueue_store_op(StoreOp::Save(stored.clone())).await;
-                            participants.insert(key, TrackedParticipant { stored, connected });
+                            participants.insert(
+                                key,
+                                TrackedParticipant {
+                                    stored,
+                                    connected,
+                                    kicked: false,
+                                },
+                            );
                         }
 
                         Msg::Sfu(SfuEvent::ParticipantJoined(key)) => {
                             match participants.get_mut(&key) {
                                 Some(participant) => {
-                                    debug!(room = %key.room, lk_id = %key.identity,
-                                        "MembershipMonitor: participant connected");
                                     participant.connected = true;
+                                    if participant.kicked {
+                                        // Back with a token that is still
+                                        // valid. Re-check membership right
+                                        // away rather than a full interval
+                                        // from now.
+                                        info!(room = %key.room, lk_id = %key.identity,
+                                            "MembershipMonitor: kicked participant reconnected, re-checking membership");
+                                        sweep_requested = true;
+                                    } else {
+                                        debug!(room = %key.room, lk_id = %key.identity,
+                                            "MembershipMonitor: participant connected");
+                                    }
                                 }
                                 None => {
                                     debug!(room = %key.room, lk_id = %key.identity,
@@ -495,10 +543,20 @@ impl MembershipMonitor {
                         }
 
                         Msg::Sfu(SfuEvent::ParticipantLeft(key)) => {
-                            if participants.remove(&key).is_some() {
-                                debug!(room = %key.room, lk_id = %key.identity,
-                                    "MembershipMonitor: participant left, no longer tracking");
-                                enqueue_store_op(StoreOp::Delete(key)).await;
+                            match participants.get_mut(&key) {
+                                // Kicked participants stay tracked until
+                                // their token has expired, so a reconnect is
+                                // caught.
+                                Some(participant) if participant.kicked => {
+                                    participant.connected = false;
+                                }
+                                Some(_) => {
+                                    debug!(room = %key.room, lk_id = %key.identity,
+                                        "MembershipMonitor: participant left, no longer tracking");
+                                    participants.remove(&key);
+                                    enqueue_store_op(StoreOp::Delete(key)).await;
+                                }
+                                None => {}
                             }
                         }
 
@@ -555,8 +613,8 @@ enum StoreOp {
 /// What a sweep needs to know, snapshotted from the participant map.
 #[derive(Debug, Default, PartialEq)]
 struct SweepInput {
-    /// Participants not (yet) known to be connected, whose presence on the
-    /// SFU is to be verified.
+    /// Participants not known to be connected — never connected, or kicked —
+    /// whose presence on the SFU is to be verified.
     pending: Vec<ParticipantKey>,
     /// The Matrix rooms with tracked participants.
     rooms: Vec<String>,
@@ -724,16 +782,16 @@ async fn query_room_membership(
 #[derive(Debug, Default, PartialEq)]
 struct SweepActions {
     /// Participants to remove from the SFU (they lost their room membership).
+    /// They stay tracked, flagged as kicked.
     kick: Vec<ParticipantKey>,
     /// LiveKit rooms to delete (the homeserver left their Matrix room).
     delete_rooms: Vec<LiveKitRoomAlias>,
-    /// Participants no longer tracked because they lost their room
-    /// membership: `kick` plus everyone in `delete_rooms`. The handler stops
-    /// their delayed-event jobs.
+    /// Participants who lost their room membership: `kick` plus everyone in
+    /// `delete_rooms`. The handler stops their delayed-event jobs.
     revoked: Vec<ParticipantKey>,
-    /// Participants no longer tracked for other reasons (their token expired
-    /// without a connect).
-    forgotten: Vec<ParticipantKey>,
+    /// Participants no longer tracked: everyone in `delete_rooms`, and
+    /// absent participants whose token has expired.
+    untracked: Vec<ParticipantKey>,
 }
 
 /// Applies a sweep outcome to the participant map and returns the actions to
@@ -755,22 +813,37 @@ fn apply_sweep_outcome(
         }
     }
 
-    let pending_ttl = chrono::Duration::from_std(PENDING_TTL).unwrap_or_default();
+    let absent_ttl = chrono::Duration::from_std(ABSENT_TTL).unwrap_or_default();
     for key in outcome.absent {
         let expired = participants
             .get(&key)
-            .is_some_and(|p| !p.connected && p.stored.registered_at + pending_ttl <= now);
+            .is_some_and(|p| !p.connected && p.stored.registered_at + absent_ttl <= now);
         if expired {
             debug!(room = %key.room, lk_id = %key.identity,
-                "MembershipMonitor: token expired without a connect, no longer tracking");
+                "MembershipMonitor: token expired while absent from the SFU, no longer tracking");
             participants.remove(&key);
-            actions.forgotten.push(key);
+            actions.untracked.push(key);
         }
     }
 
     for (room_id, membership) in outcome.rooms {
         match membership {
             RoomMembership::Joined(members) => {
+                // A connected member is in good standing, whatever happened
+                // before: a kicked participant who was let back into the room
+                // and reconnected with a still-valid token gets to stay.
+                for participant in participants.values_mut().filter(|p| {
+                    p.stored.matrix_room_id == room_id
+                        && p.connected
+                        && p.kicked
+                        && members.contains(&p.stored.matrix_user_id)
+                }) {
+                    info!(matrix_room = %room_id, matrix_id = %participant.stored.matrix_user_id,
+                        lk_id = %participant.stored.livekit_identity,
+                        "MembershipMonitor: kicked participant is a room member again");
+                    participant.kicked = false;
+                }
+
                 let kicked: Vec<ParticipantKey> = participants
                     .iter()
                     .filter(|(_, p)| {
@@ -781,10 +854,12 @@ fn apply_sweep_outcome(
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in kicked {
-                    if let Some(participant) = participants.remove(&key) {
+                    if let Some(participant) = participants.get_mut(&key) {
                         info!(matrix_room = %room_id, matrix_id = %participant.stored.matrix_user_id,
-                            room = %key.room, lk_id = %key.identity,
+                            room = %key.room, lk_id = %key.identity, again = participant.kicked,
                             "MembershipMonitor: user is no longer a room member, removing from the SFU");
+                        participant.connected = false;
+                        participant.kicked = true;
                     }
                     actions.revoked.push(key.clone());
                     actions.kick.push(key);
@@ -802,7 +877,8 @@ fn apply_sweep_outcome(
                     if !rooms.contains(&key.room) {
                         rooms.push(key.room.clone());
                     }
-                    actions.revoked.push(key);
+                    actions.revoked.push(key.clone());
+                    actions.untracked.push(key);
                 }
                 for room in rooms {
                     info!(matrix_room = %room_id, room = %room,
@@ -822,6 +898,10 @@ fn apply_sweep_outcome(
 /// A removal to perform on the SFU.
 #[derive(Debug, Clone)]
 enum SfuAction {
+    /// Revokes the participant's publish and subscribe permissions, then
+    /// removes them. The order matters: the permission change makes the SFU
+    /// push a refreshed token without media grants to the client before the
+    /// disconnect, so that token is useless for rejoining.
     RemoveParticipant(ParticipantKey),
     DeleteRoom(LiveKitRoomAlias),
 }
@@ -864,6 +944,12 @@ fn spawn_sfu_action(
                     let attempt = async {
                         match &action {
                             SfuAction::RemoveParticipant(key) => {
+                                deps.revoke_participant_permissions(
+                                    &lk_auth,
+                                    &key.room,
+                                    &key.identity,
+                                )
+                                .await?;
                                 deps.remove_participant(&lk_auth, &key.room, &key.identity)
                                     .await
                             }

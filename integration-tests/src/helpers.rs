@@ -444,6 +444,93 @@ pub async fn wait_for_remove_participant_request(
     }
 }
 
+/// Poll until at least `count` RoomService/RemoveParticipant requests for the
+/// given room and identity have been recorded, or panic once the timeout
+/// elapses.
+pub async fn wait_for_remove_participant_request_count(
+    sfu: &FakeSfu,
+    room: &str,
+    identity: &str,
+    count: usize,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let matching = sfu
+            .remove_participant_requests()
+            .iter()
+            .filter(|r| r.room == room && r.identity == identity)
+            .count();
+        if matching >= count {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {count} RemoveParticipant request(s) for room {room:?}, \
+                 identity {identity:?}, got {matching} (all requests: {:?})",
+                sfu.remove_participant_requests()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Assert that the participant's media permissions were revoked (via
+/// RoomService/UpdateParticipant, every permission off) *before* the first
+/// RoomService/RemoveParticipant for them, and that the removal named a
+/// token revocation cutoff.
+#[track_caller]
+pub fn expect_permissions_revoked_before_removal(sfu: &FakeSfu, room: &str, identity: &str) {
+    let updates = sfu.update_participant_requests();
+    let update = updates
+        .iter()
+        .find(|r| r.room == room && r.identity == identity)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an UpdateParticipant request for room {room:?}, identity {identity:?}, \
+                 got {updates:?}"
+            )
+        });
+    let permission = update
+        .permission
+        .as_ref()
+        .expect("expected the UpdateParticipant request to carry permissions");
+    assert!(
+        !permission.can_publish
+            && !permission.can_subscribe
+            && !permission.can_publish_data
+            && !permission.can_update_metadata,
+        "expected every media permission revoked, got {permission:?}"
+    );
+
+    let removals = sfu.remove_participant_requests();
+    let removal = removals
+        .iter()
+        .find(|r| r.room == room && r.identity == identity)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a RemoveParticipant request for room {room:?}, identity {identity:?}, \
+                 got {removals:?}"
+            )
+        });
+    assert!(
+        removal.revoke_token_ts > 0,
+        "expected the removal to name a token revocation cutoff, got {removal:?}"
+    );
+
+    let log = sfu.call_log();
+    let update_at = log
+        .iter()
+        .position(|c| *c == format!("UpdateParticipant {room} {identity}"));
+    let remove_at = log
+        .iter()
+        .position(|c| *c == format!("RemoveParticipant {room} {identity}"));
+    assert!(
+        matches!((update_at, remove_at), (Some(u), Some(r)) if u < r),
+        "expected the permission revocation to precede the removal, got {log:?}"
+    );
+}
+
 /// Assert that no RoomService/RemoveParticipant request has been recorded.
 #[track_caller]
 pub fn expect_no_remove_participant_requests(sfu: &FakeSfu) {

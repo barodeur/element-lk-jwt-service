@@ -288,6 +288,15 @@ pub trait RoomServiceClient: Send + Sync {
     /// [`RoomServiceError::NotFound`] when the participant (or the room) is
     /// not present.
     async fn remove_participant(&self, room: &str, identity: &str) -> Result<(), RoomServiceError>;
+    /// Replaces the permissions of the participant `identity` in `room`.
+    /// Fails with [`RoomServiceError::NotFound`] when the participant (or the
+    /// room) is not present.
+    async fn update_participant_permission(
+        &self,
+        room: &str,
+        identity: &str,
+        permission: livekit_protocol::ParticipantPermission,
+    ) -> Result<(), RoomServiceError>;
     /// Deletes `room`, disconnecting every participant in it. Fails with
     /// [`RoomServiceError::NotFound`] when the room does not exist.
     async fn delete_room(&self, room: &str) -> Result<(), RoomServiceError>;
@@ -450,6 +459,36 @@ impl RoomServiceClient for LiveKitRoomServiceClient {
                 livekit_protocol::RoomParticipantIdentity {
                     room: room.to_owned(),
                     identity: identity.to_owned(),
+                    // Every token issued to the participant so far is to be
+                    // rejected from now on. Honoured by LiveKit Cloud;
+                    // self-hosted SFUs ignore it.
+                    revoke_token_ts: unix_now(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn update_participant_permission(
+        &self,
+        room: &str,
+        identity: &str,
+        permission: livekit_protocol::ParticipantPermission,
+    ) -> Result<(), RoomServiceError> {
+        let _: livekit_protocol::ParticipantInfo = self
+            .twirp_call(
+                "UpdateParticipant",
+                livekit_api::access_token::VideoGrants {
+                    room_admin: true,
+                    room: room.to_owned(),
+                    ..Default::default()
+                },
+                livekit_protocol::UpdateParticipantRequest {
+                    room: room.to_owned(),
+                    identity: identity.to_owned(),
+                    permission: Some(permission),
+                    // Empty metadata, name and attributes leave the current
+                    // values untouched.
                     ..Default::default()
                 },
             )
@@ -806,6 +845,37 @@ pub trait Deps: Send + Sync {
         let room_client =
             self.new_room_service_client(&lk_auth.lk_url, &lk_auth.key, &lk_auth.secret);
         match room_client.remove_participant(&room.0, &identity.0).await {
+            Ok(()) | Err(RoomServiceError::NotFound(_)) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Revokes the publish and subscribe permissions of the given identity in
+    /// the given LiveKit room. The SFU pushes the participant a refreshed
+    /// token reflecting the change, which is what makes this worthwhile
+    /// right before a removal: a client reconnecting with that token can
+    /// neither send nor receive media. A participant that is (no longer)
+    /// present is not an error, for the same reason as in
+    /// [`Deps::remove_participant`].
+    async fn revoke_participant_permissions(
+        &self,
+        lk_auth: &LiveKitAuth,
+        room: &LiveKitRoomAlias,
+        identity: &LiveKitIdentity,
+    ) -> Result<(), String> {
+        let room_client =
+            self.new_room_service_client(&lk_auth.lk_url, &lk_auth.key, &lk_auth.secret);
+        let permission = livekit_protocol::ParticipantPermission {
+            can_subscribe: false,
+            can_publish: false,
+            can_publish_data: false,
+            can_update_metadata: false,
+            ..Default::default()
+        };
+        match room_client
+            .update_participant_permission(&room.0, &identity.0, permission)
+            .await
+        {
             Ok(()) | Err(RoomServiceError::NotFound(_)) => Ok(()),
             Err(err) => Err(err.to_string()),
         }
@@ -3154,12 +3224,18 @@ mod tests {
     type RemoveParticipantFn =
         Box<dyn Fn(&str, &str) -> Result<(), RoomServiceError> + Send + Sync>;
     type DeleteRoomFn = Box<dyn Fn(&str) -> Result<(), RoomServiceError> + Send + Sync>;
+    type UpdateParticipantPermissionFn = Box<
+        dyn Fn(&str, &str, livekit_protocol::ParticipantPermission) -> Result<(), RoomServiceError>
+            + Send
+            + Sync,
+    >;
 
     #[derive(Default)]
     struct MockRoomServiceClient {
         create_room_fn: Option<CreateRoomFn>,
         get_participant_fn: Option<GetParticipantFn>,
         remove_participant_fn: Option<RemoveParticipantFn>,
+        update_participant_permission_fn: Option<UpdateParticipantPermissionFn>,
         delete_room_fn: Option<DeleteRoomFn>,
     }
 
@@ -3193,6 +3269,18 @@ mod tests {
         ) -> Result<(), RoomServiceError> {
             match &self.remove_participant_fn {
                 Some(f) => f(room, identity),
+                None => Ok(()),
+            }
+        }
+
+        async fn update_participant_permission(
+            &self,
+            room: &str,
+            identity: &str,
+            permission: livekit_protocol::ParticipantPermission,
+        ) -> Result<(), RoomServiceError> {
+            match &self.update_participant_permission_fn {
+                Some(f) => f(room, identity, permission),
                 None => Ok(()),
             }
         }
@@ -3495,6 +3583,62 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
+    // ── revoke_participant_permissions via mocked room client ─────────────────
+
+    /// Every media permission is switched off; an absent participant counts
+    /// as done; any other failure surfaces.
+    #[tokio::test]
+    async fn test_revoke_participant_permissions_contract() {
+        let auth = LiveKitAuth::default();
+        let room = LiveKitRoomAlias("room".into());
+        let identity = LiveKitIdentity("id".into());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let seen: Arc<Mutex<Vec<livekit_protocol::ParticipantPermission>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let deps = RoomClientMockDeps {
+            client: Arc::new(MockRoomServiceClient {
+                update_participant_permission_fn: Some(Box::new(
+                    move |room, identity, permission| {
+                        assert_eq!((room, identity), ("room", "id"));
+                        seen_clone.lock().unwrap().push(permission);
+                        match calls_clone.fetch_add(1, Ordering::SeqCst) {
+                            0 => Ok(()),
+                            1 => Err(RoomServiceError::NotFound("not found".into())),
+                            _ => Err(RoomServiceError::Other("boom".into())),
+                        }
+                    },
+                )),
+                ..Default::default()
+            }),
+        };
+
+        deps.revoke_participant_permissions(&auth, &room, &identity)
+            .await
+            .expect("revocation should succeed");
+        deps.revoke_participant_permissions(&auth, &room, &identity)
+            .await
+            .expect("revoking for an absent participant should succeed");
+        deps.revoke_participant_permissions(&auth, &room, &identity)
+            .await
+            .expect_err("other errors should surface");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for permission in seen.iter() {
+            assert!(
+                !permission.can_publish
+                    && !permission.can_subscribe
+                    && !permission.can_publish_data
+                    && !permission.can_update_metadata
+                    && permission.can_publish_sources.is_empty(),
+                "expected every media permission revoked, got {permission:?}"
+            );
+        }
+    }
+
     // ── real Twirp room-service client ────────────────────────────────────────
     // Regression tests for the divergences from livekit-api's RoomClient:
     // a path prefix in LIVEKIT_URL must be preserved and ws/wss schemes must
@@ -3790,5 +3934,83 @@ mod tests {
             .delete_livekit_room(&auth_for(&server), &room)
             .await
             .expect_err("expected a server error");
+    }
+
+    /// Verifies the request bodies of the removal sequence: RemoveParticipant
+    /// names the current time as the token revocation cutoff, and
+    /// UpdateParticipant carries the permission set while leaving metadata
+    /// and name alone.
+    #[tokio::test]
+    async fn test_room_service_client_removal_request_bodies() {
+        use prost::Message;
+
+        // Captures every request body by path.
+        type Bodies = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+        let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let bodies_clone = bodies.clone();
+        let router = Router::new().route(
+            "/{*path}",
+            any(move |req: Request| {
+                let bodies = bodies_clone.clone();
+                async move {
+                    let path = req.uri().path().to_owned();
+                    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec();
+                    let response = if path.ends_with("/RemoveParticipant") {
+                        livekit_protocol::RemoveParticipantResponse::default().encode_to_vec()
+                    } else {
+                        livekit_protocol::ParticipantInfo::default().encode_to_vec()
+                    };
+                    bodies.lock().unwrap().push((path, body));
+                    http::Response::builder()
+                        .status(http::StatusCode::OK)
+                        .header(http::header::CONTENT_TYPE, "application/protobuf")
+                        .body(axum::body::Body::from(response))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = spawn_http_server(router).await;
+        let client = RealDeps::default().new_room_service_client(&server.url, "devkey", "secret");
+
+        let before = unix_now();
+        client
+            .remove_participant("r", "i")
+            .await
+            .expect("remove_participant failed");
+        client
+            .update_participant_permission(
+                "r",
+                "i",
+                livekit_protocol::ParticipantPermission {
+                    can_publish: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update_participant_permission failed");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+
+        assert_eq!(bodies[0].0, "/twirp/livekit.RoomService/RemoveParticipant");
+        let remove = livekit_protocol::RoomParticipantIdentity::decode(&bodies[0].1[..])
+            .expect("failed to decode RemoveParticipant body");
+        assert_eq!((remove.room.as_str(), remove.identity.as_str()), ("r", "i"));
+        assert!(
+            remove.revoke_token_ts >= before && remove.revoke_token_ts <= unix_now(),
+            "expected revoke_token_ts to be now, got {}",
+            remove.revoke_token_ts
+        );
+
+        assert_eq!(bodies[1].0, "/twirp/livekit.RoomService/UpdateParticipant");
+        let update = livekit_protocol::UpdateParticipantRequest::decode(&bodies[1].1[..])
+            .expect("failed to decode UpdateParticipant body");
+        assert_eq!((update.room.as_str(), update.identity.as_str()), ("r", "i"));
+        assert!(update.permission.is_some_and(|p| p.can_publish));
+        assert!(update.metadata.is_empty() && update.name.is_empty());
+        assert!(update.attributes.is_empty());
     }
 }

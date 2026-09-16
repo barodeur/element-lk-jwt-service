@@ -76,6 +76,84 @@ async fn kicked_user_is_removed_from_sfu() {
     alice_participant.disconnect().await;
 }
 
+/// Removing a participant leaves their tokens valid: the one the service
+/// minted, and the refreshed ones the SFU keeps pushing to a connected
+/// client. A kicked user who reconnects with either is thrown out again.
+#[tokio::test]
+async fn kicked_user_cannot_rejoin_with_refreshed_token() {
+    assert_stack_is_up();
+
+    let alice = register_user(SYNAPSE_A_CS_API_URL, "alice", "e2e-test-password").await;
+    let bob = register_user(SYNAPSE_A_CS_API_URL, "bob", "e2e-test-password").await;
+    let room_id = create_and_join_room(SYNAPSE_A_CS_API_URL, &alice).await;
+    join_room_via(SYNAPSE_A_CS_API_URL, &bob, &room_id, SYNAPSE_A_SERVER_NAME).await;
+
+    // Alice keeps the LiveKit room alive throughout, so a rejected rejoin
+    // can only be down to bob's standing, not to a closed room.
+    let alice_jwt = get_livekit_token(
+        SYNAPSE_A_CS_API_URL,
+        &alice,
+        LIVEKIT_A_URL,
+        &room_id,
+        SLOT_ID,
+        "e2e-member-alice",
+        "E2EDEVICEALICE",
+    )
+    .await;
+    let alice_participant = LiveKitParticipant::connect(LIVEKIT_A_SFU_ADDR, &alice_jwt).await;
+
+    let bob_jwt = get_livekit_token(
+        SYNAPSE_A_CS_API_URL,
+        &bob,
+        LIVEKIT_A_URL,
+        &room_id,
+        SLOT_ID,
+        "e2e-member-bob",
+        "E2EDEVICEBOB",
+    )
+    .await;
+    let bob_participant = LiveKitParticipant::connect(LIVEKIT_A_SFU_ADDR, &bob_jwt).await;
+
+    // The SFU pushes a refreshed token right after the join. Capture it
+    // while bob is still a member, i.e. with all of his grants intact.
+    let refreshed_jwt = bob_participant
+        .wait_for_refreshed_token(Duration::from_secs(15))
+        .await
+        .expect("expected the SFU to refresh bob's token after joining");
+    assert_ne!(
+        refreshed_jwt, bob_jwt,
+        "expected the refreshed token to differ from the minted one"
+    );
+
+    kick_user(SYNAPSE_A_CS_API_URL, &alice, &room_id, &bob.user_id).await;
+    assert!(
+        bob_participant.wait_for_disconnect(KICK_TIMEOUT).await,
+        "expected bob to be removed from the SFU after being kicked from the room"
+    );
+
+    // Neither token gets bob back into the call for good: the SFU may
+    // admit him (self-hosted LiveKit does not revoke tokens), but the
+    // reconnect is noticed and he is removed again promptly. This harness
+    // never negotiates media, so LiveKit sends no `participant_joined`
+    // webhook for the reconnect; it is the periodic check's presence lookup
+    // that catches it here, within one interval.
+    for (label, jwt) in [("refreshed", &refreshed_jwt), ("original", &bob_jwt)] {
+        match LiveKitParticipant::try_connect(LIVEKIT_A_SFU_ADDR, jwt).await {
+            Err(_) => {} // Rejected outright: even better.
+            Ok(rejoined) => assert!(
+                rejoined.wait_for_disconnect(KICK_TIMEOUT).await,
+                "expected bob's rejoin with the {label} token to be undone"
+            ),
+        }
+    }
+
+    assert!(
+        alice_participant.is_connected(),
+        "expected alice, still a room member, to stay connected"
+    );
+    alice_participant.disconnect().await;
+}
+
 /// A federated user who leaves the room is removed from the SFU they were
 /// subscribed on, while the local publisher stays connected.
 #[tokio::test]

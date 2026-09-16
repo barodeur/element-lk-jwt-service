@@ -190,6 +190,17 @@ by tracking every participant it issues a token for and, every
 - Any other failure to determine membership leaves the participants untouched, so a
   homeserver outage never drops calls.
 
+Removing a participant doesn't invalidate their access tokens: the one the service minted
+stays valid until it expires, and the SFU keeps refreshing a connected participant's token
+with `roomJoin` intact. A removed participant could therefore reconnect. To limit that, the
+service revokes the participant's publish and subscribe permissions right before removing
+them (which makes the SFU push a refreshed token without media grants to the client), names
+the removal time as the token revocation cutoff (honoured by LiveKit Cloud, ignored by
+self-hosted SFUs), and keeps tracking the participant until their token can no longer be
+valid. Should they reconnect regardless, they are removed again: immediately, when the SFU's
+`participant_joined` webhook reports them back (which it does once media is flowing), or at
+the next periodic check at the latest.
+
 Tracked participants are persisted in the Redis store, if configured, so that enforcement
 resumes after a restart. Note that this doesn't obsolete short-lived access tokens: a
 participant is only ever removed at the next check, up to one interval after losing their

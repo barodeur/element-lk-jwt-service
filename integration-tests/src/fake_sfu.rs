@@ -35,6 +35,15 @@ pub struct GetParticipantRequest {
 pub struct RemoveParticipantRequest {
     pub room: String,
     pub identity: String,
+    /// The token revocation cutoff the request named, 0 when it named none.
+    pub revoke_token_ts: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateParticipantRequest {
+    pub room: String,
+    pub identity: String,
+    pub permission: Option<proto::ParticipantPermission>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,8 +59,14 @@ struct SfuState {
     get_participant_requests: Vec<GetParticipantRequest>,
     /// The recorded RoomService/RemoveParticipant requests.
     remove_participant_requests: Vec<RemoveParticipantRequest>,
+    /// The recorded RoomService/UpdateParticipant requests.
+    update_participant_requests: Vec<UpdateParticipantRequest>,
     /// The recorded RoomService/DeleteRoom requests.
     delete_room_requests: Vec<DeleteRoomRequest>,
+    /// Every participant-mutating RoomService call, in order, as
+    /// "<method> <room> <identity>". Lets tests assert on ordering across
+    /// methods.
+    call_log: Vec<String>,
     /// (room, identity) pairs currently considered present, per
     /// RoomService/GetParticipant. Removed by RemoveParticipant and
     /// DeleteRoom.
@@ -88,6 +103,10 @@ impl FakeSfu {
                 post(handle_remove_participant),
             )
             .route(
+                "/twirp/livekit.RoomService/UpdateParticipant",
+                post(handle_update_participant),
+            )
+            .route(
                 "/twirp/livekit.RoomService/DeleteRoom",
                 post(handle_delete_room),
             )
@@ -121,9 +140,24 @@ impl FakeSfu {
             .clone()
     }
 
+    /// The recorded RoomService/UpdateParticipant requests.
+    pub fn update_participant_requests(&self) -> Vec<UpdateParticipantRequest> {
+        self.state
+            .lock()
+            .unwrap()
+            .update_participant_requests
+            .clone()
+    }
+
     /// The recorded RoomService/DeleteRoom requests.
     pub fn delete_room_requests(&self) -> Vec<DeleteRoomRequest> {
         self.state.lock().unwrap().delete_room_requests.clone()
+    }
+
+    /// Every participant-mutating RoomService call so far, in order, as
+    /// "<method> <room> <identity>".
+    pub fn call_log(&self) -> Vec<String> {
+        self.state.lock().unwrap().call_log.clone()
     }
 
     /// Mark (room, identity) as present, so GetParticipant succeeds for it.
@@ -254,7 +288,12 @@ async fn handle_remove_participant(
         .push(RemoveParticipantRequest {
             room: request.room.clone(),
             identity: request.identity.clone(),
+            revoke_token_ts: request.revoke_token_ts,
         });
+    state.call_log.push(format!(
+        "RemoveParticipant {} {}",
+        request.room, request.identity
+    ));
 
     if state
         .participants
@@ -263,6 +302,56 @@ async fn handle_remove_participant(
         (
             [(header::CONTENT_TYPE, "application/protobuf")],
             proto::RemoveParticipantResponse::default().encode_to_vec(),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "not_found", "msg": "participant does not exist" })),
+        )
+            .into_response()
+    }
+}
+
+/// Handler for RoomService/UpdateParticipant requests. Records the request;
+/// a participant that is not present is reported as not_found, like the
+/// real SFU does.
+async fn handle_update_participant(
+    State(state): State<Arc<Mutex<SfuState>>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Ok(request) = proto::UpdateParticipantRequest::decode(body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "malformed", "msg": "invalid protobuf body" })),
+        )
+            .into_response();
+    };
+
+    let mut state = state.lock().unwrap();
+    state
+        .update_participant_requests
+        .push(UpdateParticipantRequest {
+            room: request.room.clone(),
+            identity: request.identity.clone(),
+            permission: request.permission,
+        });
+    state.call_log.push(format!(
+        "UpdateParticipant {} {}",
+        request.room, request.identity
+    ));
+
+    if state
+        .participants
+        .contains(&(request.room.clone(), request.identity.clone()))
+    {
+        let info = proto::ParticipantInfo {
+            identity: request.identity,
+            ..Default::default()
+        };
+        (
+            [(header::CONTENT_TYPE, "application/protobuf")],
+            info.encode_to_vec(),
         )
             .into_response()
     } else {
