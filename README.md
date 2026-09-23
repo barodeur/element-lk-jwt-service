@@ -143,6 +143,9 @@ scope to be set. The service does not require any event traffic, however. So mak
 Additionally, request proxying needs to be enabled for the `/rtc/livekit` subpath in the Client-Server
 and Server-Server API. This is done via the `proxy_prefix` and `proxy_url` properties.
 
+Running as an application service is also what allows the service to manage delegated delayed leave
+events on behalf of the homeserver's users (see [LiveKit SFU Wiring](#-livekit-sfu-wiring-webhooks)).
+
 Below is an example application service registration file.
 
 ```yaml
@@ -192,6 +195,12 @@ webhook:
 >   disconnects and therefore cannot send the delegated leave event. The
 >   `LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS` pull-based fallback partially
 >   mitigates this.
+
+> [!IMPORTANT]
+> Delegated delayed leave handling also requires running as an application service.
+> The [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/4140-delayed-events-futures.md)
+> endpoints that restart and send a delayed event are authenticated and
+> scoped to the user who scheduled it.
 
 ## 🔒 Transport Layer Security (TLS) Setup Using a Reverse Proxy
 
