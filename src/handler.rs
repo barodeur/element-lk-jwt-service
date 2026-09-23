@@ -895,7 +895,8 @@ impl Handler {
                     delay_timeout: Duration::from_millis(req.delay_timeout.max(0) as u64),
                     livekit_room: lk_room_alias.clone(),
                     livekit_identity: lk_identity.clone(),
-                    owner_user_id: String::new(), // Unset because the user ID is only used for identity assertion when running as an application service.
+                    owner_user_id: self
+                        .owner_user_id_for(&req.openid_token.matrix_server_name, &matrix_id),
                 })
                 .await
                 .map_err(matrix_error_for_add_job)?;
@@ -971,7 +972,8 @@ impl Handler {
                     delay_timeout: Duration::from_millis(req.delay_timeout.max(0) as u64),
                     livekit_room: lk_room_alias.clone(),
                     livekit_identity: lk_identity.clone(),
-                    owner_user_id: String::new(), // Unset because the user ID is only used for identity assertion when running as an application service.
+                    owner_user_id: self
+                        .owner_user_id_for(&req.openid_token.matrix_server_name, &matrix_id),
                 })
                 .await
                 .map_err(matrix_error_for_add_job)?;

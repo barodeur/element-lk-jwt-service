@@ -2198,6 +2198,98 @@ async fn test_process_sfu_request() {
     }
 }
 
+/// Deps for a /get_token or /sfu/get delegation by @user:example.com whose
+/// participant is already on the SFU.
+fn local_user_delegation_deps(
+    execute_delayed_event_action_fn: Option<ExecuteDelayedEventActionFn>,
+) -> HandlerTestDeps {
+    HandlerTestDeps {
+        exchange_openid_userinfo_fn: exchange_openid_userinfo_ok("@user:example.com"),
+        resolve_cs_api_url_fn: Some(Box::new(|_| {
+            Ok(CsApiUrl("https://matrix.example.com".into()))
+        })),
+        create_livekit_room_fn: Some(Box::new(|_, _, _| Ok(()))),
+        participant_exists_fn: Some(Box::new(|_, _| Box::pin(async { Ok(true) }))),
+        execute_delayed_event_action_fn,
+        ..Default::default()
+    }
+}
+
+/// When running as the application service of the requesting user's
+/// homeserver, a /get_token delegation asserts the OpenID-verified user's
+/// identity on the job's delayed-event management calls.
+#[tokio::test]
+async fn test_process_sfu_request_delegation_asserts_identity_for_local_user() {
+    let (captured, execute_delayed_event_action_fn) = execute_delayed_event_action_capturing_auth();
+    // Runs as the application service of example.com.
+    let handler =
+        new_get_token_cs_handler(local_user_delegation_deps(execute_delayed_event_action_fn));
+    let req = SfuRequest {
+        room_id: "!room:example.com".into(),
+        slot_id: "m.call#ROOM".into(),
+        openid_token: OpenIdTokenType {
+            access_token: "token".into(),
+            matrix_server_name: "example.com".into(),
+            ..Default::default()
+        },
+        member: MatrixRtcMemberType {
+            id: "member-id".into(),
+            claimed_user_id: "@user:example.com".into(),
+            claimed_device_id: "device-id".into(),
+        },
+        delay_id: "syd_delay123".into(),
+        delay_timeout: 30000,
+        ..Default::default()
+    };
+
+    handler
+        .process_sfu_request(&req)
+        .await
+        .expect("unexpected error");
+
+    let (as_token, user_id) = wait_for_captured_auth(&captured).await;
+    assert_eq!(as_token, "as_token", "expected the configured as_token");
+    assert_eq!(
+        user_id, "@user:example.com",
+        "expected the OpenID-verified user as user_id"
+    );
+    handler.close().await;
+}
+
+/// Same as above for the deprecated /sfu/get endpoint.
+#[tokio::test]
+async fn test_process_legacy_sfu_request_delegation_asserts_identity_for_local_user() {
+    let (captured, execute_delayed_event_action_fn) = execute_delayed_event_action_capturing_auth();
+    // Runs as the application service of example.com.
+    let handler =
+        new_get_token_cs_handler(local_user_delegation_deps(execute_delayed_event_action_fn));
+    let req = LegacySfuRequest {
+        room: "!room:example.com".into(),
+        openid_token: OpenIdTokenType {
+            access_token: "token".into(),
+            matrix_server_name: "example.com".into(),
+            ..Default::default()
+        },
+        device_id: "device-id".into(),
+        delay_id: "syd_delay123".into(),
+        delay_timeout: 30000,
+        ..Default::default()
+    };
+
+    handler
+        .process_legacy_sfu_request(&req)
+        .await
+        .expect("unexpected error");
+
+    let (as_token, user_id) = wait_for_captured_auth(&captured).await;
+    assert_eq!(as_token, "as_token", "expected the configured as_token");
+    assert_eq!(
+        user_id, "@user:example.com",
+        "expected the OpenID-verified user as user_id"
+    );
+    handler.close().await;
+}
+
 // ── /rtc/livekit/get_token C-S endpoint ─────────────────────────────
 
 /// Non-POST/OPTIONS requests return 405.
